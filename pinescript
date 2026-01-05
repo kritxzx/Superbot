@@ -1,0 +1,122 @@
+//@version=5
+strategy("HMA Recovery Bot (Soft Martingale)", overlay=true, initial_capital=30, currency=currency.USD, default_qty_type=strategy.cash, default_qty_value=1000)
+
+// ==========================================
+// ⚙️ SETTINGS (ตั้งค่า)
+// ==========================================
+// 1. Indicator Settings
+hmaLen = input.int(14, "HMA Length")
+
+// 2. SL & Trailing (แปลงหน่วยเป็น USD Price movement เพื่อความชัวร์)
+// ใน MT5: 5000 points = $50.00, 500 points = $5.00
+slUSD = input.float(5.0, "Stop Loss Distance ($)", tooltip="ระยะ SL เป็นดอลลาร์ (เช่น 50 = $50)")
+trailTriggerUSD = input.float(0.5, "Trailing Trigger ($)", tooltip="กำไรกี่ดอลลาร์เริ่มเลื่อน SL")
+trailDistUSD = input.float(0.01, "Trailing Distance ($)", tooltip="รักษาระยะห่างกี่ดอลลาร์")
+
+// 3. Money Management
+balanceStep = input.float(300, "Balance Step ($)", tooltip="ทุกๆ ทุนเท่านี้ ออก 0.01 Lot")
+multiplier = input.float(1.5, "Recovery Multiplier (x)", tooltip="ตัวคูณเมื่อแพ้")
+maxStreak = input.int(4, "Max Loss Streak", tooltip="แพ้ติดกันได้กี่ครั้งก่อน Reset")
+maxLotCap = input.float(1.0, "Max Lot Cap", tooltip="ห้ามออก Lot เกินนี้")
+
+// ==========================================
+// 🔧 LOGIC & INDICATORS
+// ==========================================
+
+// --- คำนวณ HMA ---
+hmaValue = ta.hma(close, hmaLen)
+
+// ดูแนวโน้ม (Trend Logic)
+isTrendUp = hmaValue > hmaValue[1]
+isTrendDown = hmaValue < hmaValue[1]
+
+// สัญญาณเข้า (Entry Signal) - เข้าเมื่อเปลี่ยนสี
+buySignal = isTrendUp and isTrendDown[1]
+sellSignal = isTrendDown and isTrendUp[1]
+
+// Plot HMA สวยๆ
+plot(hmaValue, "HMA", color = isTrendUp ? color.lime : color.red, linewidth=3)
+
+// ==========================================
+// 💰 MONEY MANAGEMENT (MARTINGALE)
+// ==========================================
+
+// ตัวแปรเก็บจำนวนครั้งที่แพ้ติดกัน (ใช้ var เพื่อจำค่าข้ามแท่ง)
+var int lossStreak = 0
+
+// ตรวจสอบผลเทรดล่าสุด (อัปเดต streak)
+if strategy.closedtrades > strategy.closedtrades[1] // มีการปิดออเดอร์เกิดขึ้น
+    // เช็คผลกำไรของไม้ล่าสุด (Index ของไม้ล่าสุดคือ closedtrades - 1)
+    bool isWin = strategy.closedtrades.profit(strategy.closedtrades - 1) >= 0
+    
+    if isWin
+        lossStreak := 0 // ชนะ -> Reset กลับไปเริ่มใหม่
+    else
+        lossStreak += 1 // แพ้ -> บวก 1
+        // ถ้าแพ้เกินลิมิต ให้ Reset (ยอมมอบตัวแล้วเริ่มใหม่)
+        if lossStreak >= maxStreak
+            lossStreak := 0 
+
+// --- คำนวณ Lot Size ---
+// 1. คำนวณ Base Lot ตามขนาดพอร์ต (Balance / Step) * 0.01
+// หมายเหตุ: TradingView Equity เปลี่ยนตลอดเวลา
+baseLot = math.floor(strategy.equity / balanceStep) * 0.01 
+if baseLot < 0.01
+    baseLot := 0.01
+
+// 2. คำนวณ Martingale Lot
+// สูตร: Base * (Multiplier ^ จำนวนครั้งที่แพ้)
+currentLot = baseLot * math.pow(multiplier, lossStreak)
+
+// 3. ตัด Lot ไม่ให้เกิน Max Cap
+if currentLot > maxLotCap
+    currentLot := maxLotCap
+
+// ปัดเศษทศนิยม 2 ตำแหน่ง
+currentLot := math.round(currentLot * 100) / 100
+
+// แปลง Lot เป็น Contract Size (สำหรับ XAUUSD 1 Lot Standard = 100 Ounces/Units)
+// *สำคัญ* ถ้าโบรคเกอร์ใน TradingView 1 contract = 1 unit ต้องคูณ 100 ถึงจะเป็น 1 Standard Lot
+// แต่เพื่อให้ดูง่ายใน Backtest ผมจะใส่เป็นจำนวน Unit ตรงๆ (เช่น 0.01 Lot = 1 Unit)
+qtySize = currentLot * 100 
+
+// ==========================================
+// 🚀 EXECUTION (ส่งคำสั่ง)
+// ==========================================
+
+// ตรวจสอบสถานะปัจจุบัน
+bool isLong = strategy.position_size > 0
+bool isShort = strategy.position_size < 0
+
+// ปิดสถานะเดิมถ้าสัญญาณกลับตัว (Flip)
+if buySignal and isShort
+    strategy.close_all(comment="Flip Buy")
+if sellSignal and isLong
+    strategy.close_all(comment="Flip Sell")
+
+// เปิดออเดอร์ใหม่
+if buySignal
+    strategy.entry("Long", strategy.long, qty=qtySize, comment="B | Lot: " + str.tostring(currentLot))
+
+if sellSignal
+    strategy.entry("Short", strategy.short, qty=qtySize, comment="S | Lot: " + str.tostring(currentLot))
+
+// ==========================================
+// ⛓️ EXIT & TRAILING STOP
+// ==========================================
+// TradingView ใช้หน่วยเป็น Ticks หรือ Price, เพื่อความแม่นยำผมจะใช้ Price
+
+// คำนวณราคา SL และ Trailing
+// ใน Pine Script: strategy.exit รองรับ trail_price และ trail_offset
+
+// ส่งคำสั่ง Exit พร้อม SL และ Trailing
+// trail_points: กำไรกี่จุดเริ่มทำงาน (แปลง USD เป็น Tick)
+// trail_offset: รักษาระยะห่างกี่จุด
+// *สมมติ XAUUSD Tick size = 0.01*
+tickSize = syminfo.mintick // ปกติคือ 0.01
+slTicks = slUSD / tickSize
+trigTicks = trailTriggerUSD / tickSize
+distTicks = trailDistUSD / tickSize
+
+strategy.exit("Exit Long", "Long", loss=slTicks, trail_points=trigTicks, trail_offset=distTicks)
+strategy.exit("Exit Short", "Short", loss=slTicks, trail_points=trigTicks, trail_offset=distTicks)
